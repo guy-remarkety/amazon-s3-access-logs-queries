@@ -1,0 +1,499 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Stack that deploys a bucket which you can use as a target for your Amazon
+  S3 access logs (use the prefix ''new/''). An event notification is configured so
+  that new objects created will fire an AWS Lambda function that moves the objects
+  to prefixes (under ''partitioned/'') that adhere to the Apache Hive partitioning
+  format. This way the data is easier to consume for big data tools (as Amazon Athena
+  and AWS Glue).
+
+  '
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Default: myapp
+    ConstraintDescription: '[a-z0-9]+/'
+    MinLength: 1
+    MaxLength: 20
+    Description: 'Prefix that is used for the created resources (20 chars, a-z and
+      0-9 only)
+
+      '
+  NewKeyPrefix:
+    Type: String
+    Default: new/
+    ConstraintDescription: '[A-Za-z0-9\-]+/'
+    Description: 'Prefix of new access log files that are written by Amazon S3. Including
+      the trailing slash.
+
+      '
+  PartitionedKeyPrefix:
+    Type: String
+    Default: partitioned/
+    ConstraintDescription: '[A-Za-z0-9\-]+/'
+    Description: 'Prefix of raw access log files that are moved to the Apache Hive
+      like style. Including the trailing slash.
+
+      '
+  ParquetKeyPrefix:
+    Type: String
+    Default: partitioned-parquet/
+    ConstraintDescription: '[A-Za-z0-9\-]+/'
+    Description: 'Prefix of parquet files that are created in Apache Hive like style
+      by the CTAS query. Including the trailing slash.
+
+      '
+Resources:
+  TransformPartFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://sam-serverless-apps-interamind/117fff432153a7fbfb78052da5b065f3
+      Handler: transformPartition.handler
+      Runtime: nodejs12.x
+      Timeout: 900
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - athena:StartQueryExecution
+          - athena:GetQueryExecution
+          Resource: '*'
+        - Effect: Allow
+          Action:
+          - s3:ListBucket
+          - s3:GetBucketLocation
+          Resource:
+            Fn::Sub: arn:aws:s3:::${ResourcePrefix}-${AWS::AccountId}-s3-access-logs
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          - s3:GetObject
+          Resource:
+            Fn::Sub: arn:aws:s3:::${ResourcePrefix}-${AWS::AccountId}-s3-access-logs/*
+        - Effect: Allow
+          Action:
+          - glue:CreatePartition
+          - glue:GetDatabase
+          - glue:GetTable
+          - glue:BatchCreatePartition
+          - glue:GetPartition
+          - glue:GetPartitions
+          - glue:CreateTable
+          - glue:DeleteTable
+          - glue:DeletePartition
+          Resource: '*'
+      Environment:
+        Variables:
+          SOURCE_TABLE:
+            Ref: PartitionedTable
+          TARGET_TABLE:
+            Ref: PartitionedParquetTable
+          DATABASE:
+            Ref: CfLogsDatabase
+          ATHENA_QUERY_RESULTS_LOCATION:
+            Fn::Sub: s3://${ResourcePrefix}-${AWS::AccountId}-s3-access-logs/athena-query-results
+      Events:
+        HourlyEvt:
+          Type: Schedule
+          Properties:
+            Schedule: cron(1 * * * ? *)
+  CreatePartFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://sam-serverless-apps-interamind/117fff432153a7fbfb78052da5b065f3
+      Handler: createPartitions.handler
+      Runtime: nodejs12.x
+      Timeout: 5
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - athena:StartQueryExecution
+          - athena:GetQueryExecution
+          Resource: '*'
+        - Effect: Allow
+          Action:
+          - s3:ListBucket
+          - s3:GetBucketLocation
+          Resource:
+            Fn::Sub: arn:aws:s3:::${ResourcePrefix}-${AWS::AccountId}-s3-access-logs
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource:
+            Fn::Sub: arn:aws:s3:::${ResourcePrefix}-${AWS::AccountId}-s3-access-logs/*
+        - Effect: Allow
+          Action:
+          - glue:CreatePartition
+          - glue:GetDatabase
+          - glue:GetTable
+          - glue:BatchCreatePartition
+          Resource: '*'
+      Environment:
+        Variables:
+          TABLE:
+            Ref: PartitionedTable
+          DATABASE:
+            Ref: CfLogsDatabase
+          ATHENA_QUERY_RESULTS_LOCATION:
+            Fn::Sub: s3://${ResourcePrefix}-${AWS::AccountId}-s3-access-logs/athena-query-results
+      Events:
+        HourlyEvt:
+          Type: Schedule
+          Properties:
+            Schedule: cron(55 * * * ? *)
+  MoveNewAccessLogsFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3://sam-serverless-apps-interamind/117fff432153a7fbfb78052da5b065f3
+      Handler: moveAccessLogs.handler
+      Runtime: nodejs12.x
+      Timeout: 30
+      Policies:
+      - Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+          - s3:GetObject
+          - s3:DeleteObject
+          Resource:
+            Fn::Sub: arn:aws:s3:::${ResourcePrefix}-${AWS::AccountId}-s3-access-logs/${NewKeyPrefix}*
+        - Effect: Allow
+          Action:
+          - s3:PutObject
+          Resource:
+            Fn::Sub: arn:aws:s3:::${ResourcePrefix}-${AWS::AccountId}-s3-access-logs/${PartitionedKeyPrefix}*
+      Environment:
+        Variables:
+          TARGET_KEY_PREFIX:
+            Ref: PartitionedKeyPrefix
+      Events:
+        AccessLogsUploadedEvent:
+          Type: S3
+          Properties:
+            Bucket:
+              Ref: S3AccessLogsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                - Name: prefix
+                  Value:
+                    Ref: NewKeyPrefix
+  S3AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Description: Bucket for Amazon S3 access logs
+    Properties:
+      BucketName:
+        Fn::Sub: ${ResourcePrefix}-${AWS::AccountId}-s3-access-logs
+  CfLogsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseInput:
+        Name:
+          Fn::Sub: ${ResourcePrefix}_s3_access_logs_db
+  PartitionedTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: CfLogsDatabase
+      TableInput:
+        Name: partitioned
+        Description: Raw logs delivered by Amazon S3 partitioned
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          skip.header.line.count: '0'
+        PartitionKeys:
+        - Name: year
+          Type: string
+        - Name: month
+          Type: string
+        - Name: day
+          Type: string
+        - Name: hour
+          Type: string
+        StorageDescriptor:
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Columns:
+          - Name: date
+            Type: date
+          - Name: time
+            Type: string
+          - Name: bucketowner
+            Type: string
+          - Name: bucket
+            Type: string
+          - Name: remoteip
+            Type: string
+          - Name: requester
+            Type: string
+          - Name: requestid
+            Type: string
+          - Name: operation
+            Type: string
+          - Name: key
+            Type: string
+          - Name: requesturi_operation
+            Type: string
+          - Name: requesturi_key
+            Type: string
+          - Name: requesturi_httpprotoversion
+            Type: string
+          - Name: httpstatus
+            Type: string
+          - Name: errorcode
+            Type: string
+          - Name: bytessent
+            Type: bigint
+          - Name: objectsize
+            Type: bigint
+          - Name: totaltime
+            Type: string
+          - Name: turnaroundtime
+            Type: string
+          - Name: referrer
+            Type: string
+          - Name: useragent
+            Type: string
+          - Name: versionid
+            Type: string
+          - Name: hostid
+            Type: string
+          - Name: sigv
+            Type: string
+          - Name: ciphersuite
+            Type: string
+          - Name: authtype
+            Type: string
+          - Name: endpoint
+            Type: string
+          - Name: tlsversion
+            Type: string
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          Location:
+            Fn::Sub: s3://${ResourcePrefix}-${AWS::AccountId}-s3-access-logs/${PartitionedKeyPrefix}
+          SerdeInfo:
+            Parameters:
+              input.regex: '([^ ]*) ([^ ]*) \\[(.*?)\\] ([^ ]*) ([^ ]*) ([^ ]*) ([^
+                ]*) ([^ ]*) \\\"([^ ]*) ([^ ]*) (- |[^ ]*)\\\" (-|[0-9]*) ([^ ]*)
+                ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) (\"[^\"]*\") ([^ ]*)(?: ([^
+                ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*))?.*$'
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+  PartitionedParquetTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: CfLogsDatabase
+      TableInput:
+        Name: partitioned_parquet
+        Description: Parquet format access logs as transformed from raw version
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          has_encrypted_data: 'false'
+          parquet.compression: SNAPPY
+        PartitionKeys:
+        - Name: year
+          Type: string
+        - Name: month
+          Type: string
+        - Name: day
+          Type: string
+        - Name: hour
+          Type: string
+        StorageDescriptor:
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          Columns:
+          - Name: date
+            Type: date
+          - Name: time
+            Type: string
+          - Name: bucketowner
+            Type: string
+          - Name: bucket
+            Type: string
+          - Name: remoteip
+            Type: string
+          - Name: requester
+            Type: string
+          - Name: requestid
+            Type: string
+          - Name: operation
+            Type: string
+          - Name: key
+            Type: string
+          - Name: requesturi_operation
+            Type: string
+          - Name: requesturi_key
+            Type: string
+          - Name: requesturi_httpprotoversion
+            Type: string
+          - Name: httpstatus
+            Type: string
+          - Name: errorcode
+            Type: string
+          - Name: bytessent
+            Type: bigint
+          - Name: objectsize
+            Type: bigint
+          - Name: totaltime
+            Type: string
+          - Name: turnaroundtime
+            Type: string
+          - Name: referrer
+            Type: string
+          - Name: useragent
+            Type: string
+          - Name: versionid
+            Type: string
+          - Name: hostid
+            Type: string
+          - Name: sigv
+            Type: string
+          - Name: ciphersuite
+            Type: string
+          - Name: authtype
+            Type: string
+          - Name: endpoint
+            Type: string
+          - Name: tlsversion
+            Type: string
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          Location:
+            Fn::Sub: s3://${ResourcePrefix}-${AWS::AccountId}-s3-access-logs/${ParquetKeyPrefix}
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+  CombinedView:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId:
+        Ref: AWS::AccountId
+      DatabaseName:
+        Ref: S3LogsDatabase
+      TableInput:
+        Name: combined
+        Description: combined view over raw and parquet tables
+        TableType: VIRTUAL_VIEW
+        Parameters:
+          presto_view: 'true'
+        PartitionKeys: []
+        StorageDescriptor:
+          Columns:
+          - Name: date
+            Type: date
+          - Name: time
+            Type: string
+          - Name: bucketowner
+            Type: string
+          - Name: bucket
+            Type: string
+          - Name: remoteip
+            Type: string
+          - Name: requester
+            Type: string
+          - Name: requestid
+            Type: string
+          - Name: operation
+            Type: string
+          - Name: key
+            Type: string
+          - Name: requesturi_operation
+            Type: string
+          - Name: requesturi_key
+            Type: string
+          - Name: requesturi_httpprotoversion
+            Type: string
+          - Name: httpstatus
+            Type: string
+          - Name: errorcode
+            Type: string
+          - Name: bytessent
+            Type: bigint
+          - Name: objectsize
+            Type: bigint
+          - Name: totaltime
+            Type: string
+          - Name: turnaroundtime
+            Type: string
+          - Name: referrer
+            Type: string
+          - Name: useragent
+            Type: string
+          - Name: versionid
+            Type: string
+          - Name: hostid
+            Type: string
+          - Name: sigv
+            Type: string
+          - Name: ciphersuite
+            Type: string
+          - Name: authtype
+            Type: string
+          - Name: endpoint
+            Type: string
+          - Name: tlsversion
+            Type: string
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+          - Name: hour
+            Type: string
+          - Name: file
+            Type: string
+          SerdeInfo: {}
+        ViewOriginalText:
+          Fn::Join:
+          - ''
+          - - '/* Presto View: '
+            - Fn::Base64:
+                Fn::Sub:
+                - "{\n  \"originalSql\": \"SELECT *, \\\"$path\\\" as file FROM ${database}.${partitioned_table}\
+                  \ WHERE (concat(year, month, day, hour) >= date_format(date_trunc('hour',\
+                  \ ((current_timestamp - INTERVAL  '15' MINUTE) - INTERVAL  '1' HOUR)),\
+                  \ '%Y%m%d%H')) UNION ALL SELECT *, \\\"$path\\\" as file FROM ${database}.${partitioned_parquet_table}\
+                  \ WHERE (concat(year, month, day, hour) < date_format(date_trunc('hour',\
+                  \ ((current_timestamp - INTERVAL  '15' MINUTE) - INTERVAL  '1' HOUR)),\
+                  \ '%Y%m%d%H'))\",\n  \"catalog\": \"awsdatacatalog\",\n  \"schema\"\
+                  : \"${database}\",\n  \"columns\": [\n    {\"name\": \"date\", \"\
+                  type\": \"date\"},\n    {\"name\": \"time\", \"type\": \"varchar\"\
+                  },\n    {\"name\": \"remoteip\", \"type\": \"varchar\"},\n    {\"\
+                  name\": \"requester\", \"type\": \"varchar\"},\n    {\"name\": \"\
+                  requestid\", \"type\": \"varchar\"},\n    {\"name\": \"operation\"\
+                  , \"type\": \"varchar\"},\n    {\"name\": \"key\", \"type\": \"\
+                  varchar\"},\n    {\"name\": \"requesturi_operation\", \"type\":\
+                  \ \"varchar\"},\n    {\"name\": \"requesturi_key\", \"type\": \"\
+                  varchar\"},\n    {\"name\": \"requesturi_httpprotoversion\", \"\
+                  type\": \"varchar\"},\n    {\"name\": \"httpstatus\", \"type\":\
+                  \ \"varchar\"},\n    {\"name\": \"errorcode\", \"type\": \"varchar\"\
+                  },\n    {\"name\": \"bytessent\", \"type\": \"bigint\"},\n    {\"\
+                  name\": \"objectsize\", \"type\": \"bigint\"},\n    {\"name\": \"\
+                  totaltime\", \"type\": \"varchar\"},\n    {\"name\": \"turnaroundtime\"\
+                  , \"type\": \"varchar\"},\n    {\"name\": \"referrer\", \"type\"\
+                  : \"varchar\"},\n    {\"name\": \"useragent\", \"type\": \"varchar\"\
+                  },\n    {\"name\": \"versionid\", \"type\": \"varchar\"},\n    {\"\
+                  name\": \"hostid\", \"type\": \"varchar\"},\n    {\"name\": \"sigv\"\
+                  , \"type\": \"varchar\"},\n    {\"name\": \"ciphersuite\", \"type\"\
+                  : \"varchar\"},\n    {\"name\": \"authtype\", \"type\": \"varchar\"\
+                  },\n    {\"name\": \"endpoint\", \"type\": \"varchar\"},\n    {\"\
+                  name\": \"tlsversion\", \"type\": \"varchar\"},\n    {\"name\":\
+                  \ \"year\", \"type\": \"varchar\"},\n    {\"name\": \"month\", \"\
+                  type\": \"varchar\"},\n    {\"name\": \"day\", \"type\": \"varchar\"\
+                  },\n    {\"name\": \"hour\", \"type\": \"varchar\"},\n    {\"name\"\
+                  : \"file\", \"type\": \"varchar\"}\n  ]\n}"
+                - database:
+                    Ref: S3LogsDatabase
+                  partitioned_table:
+                    Ref: PartitionedTable
+                  partitioned_parquet_table:
+                    Ref: PartitionedParquetTable
+            - ' */'

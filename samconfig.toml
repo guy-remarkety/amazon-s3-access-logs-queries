@@ -1,0 +1,11 @@
+version = 0.1
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "s3-access-logs-for-athena"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-1dz93xdqdzqpe"
+s3_prefix = "s3-access-logs-for-athena"
+region = "us-east-1"
+profile = "guy"
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "ResourcePrefix=\"s3accesslogs\" NewKeyPrefix=\"new/\" PartitionedKeyPrefix=\"partitioned/\" ParquetKeyPrefix=\"partitioned-parquet/\""
